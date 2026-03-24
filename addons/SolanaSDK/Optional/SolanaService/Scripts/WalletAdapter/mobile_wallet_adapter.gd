@@ -29,7 +29,7 @@ func _safe_android_call(method_name: String, arg0 = null, arg1 = null, arg2 = nu
 	# Try the call directly without has_method.
 	# Some Godot 4 JNISingleton versions don't report methods correctly via has_method.
 	# We rely on Godot's internal JNI dispatch to handle it.
-	print("MWA: JNI call: ", method_name)
+	print_verbose("MWA: JNI call: ", method_name)
 	
 	# Determine target name (optional snakification).
 	var target_name = method_name
@@ -59,107 +59,110 @@ signal messages_signed(signed_messages: Array, addresses: Array)
 signal signing_failed(error: String)
 
 func is_logged_in() -> bool:
-	# For the cache lifecycle, the primary signal is "do we have a token?"
 	return auth_cache != null and auth_cache.has_valid_token()
+
+func _disconnect_if_connected(signal_ref: Signal, callback: Callable) -> void:
+	if signal_ref.is_connected(callback):
+		signal_ref.disconnect(callback)
+
+func _disconnect_connection_callbacks(established_cb: Callable, failed_cb: Callable) -> void:
+	_disconnect_if_connected(wallet_adapter.connection_established, established_cb)
+	_disconnect_if_connected(wallet_adapter.connection_failed, failed_cb)
+
+func _account_from_variant(key_variant: Variant) -> Dictionary:
+	if key_variant == null:
+		return {"error": "connected key is null"}
+
+	if key_variant is PackedByteArray:
+		if key_variant.is_empty():
+			return {"error": "connected key bytes are empty"}
+		return {"account": SolanaUtils.bs58_encode(key_variant)}
+	elif key_variant is String:
+		if key_variant.is_empty():
+			return {"error": "connected key string is empty"}
+		return {"account": key_variant}
+	elif key_variant.has_method("to_string"):
+		var account = String(key_variant.to_string())
+		if account.is_empty():
+			return {"error": "connected key conversion produced empty string"}
+		return {"account": account}
+	else:
+		return {"error": "unsupported connected key type: %s" % typeof(key_variant)}
 
 func _wait_for_authorization(start_call: Callable) -> Dictionary:
 	if wallet_adapter == null:
 		return {"error": "wallet_adapter is null"}
 
-	var done := false
+	var connection_resolved := false
 	var result: Dictionary = {}
 
 	var established_cb = func() -> void:
-		done = true
+		connection_resolved = true
 		var token : String = wallet_adapter.get_auth_token()
 		var wallet_uri_base := ""
 		if wallet_adapter.has_method("get_wallet_uri_base"):
 			wallet_uri_base = String(wallet_adapter.get_wallet_uri_base())
-		var key_variant := wallet_adapter.get_connected_key()
-		var account := ""
-		if key_variant != null:
-			if key_variant is PackedByteArray:
-				account = SolanaUtils.bs58_encode(key_variant)
-			elif key_variant.has_method("to_string"):
-				account = key_variant.to_string()
-			else:
-				account = str(key_variant)
+		var parsed_account := _account_from_variant(wallet_adapter.get_connected_key())
+		if parsed_account.has("error"):
+			result = {"error": String(parsed_account["error"])}
+			return
 
 		result = {
 			"auth_token": token,
-			"account_address": account,
+			"account_address": String(parsed_account["account"]),
 			"wallet_uri_base": wallet_uri_base,
 		}
 
 	var failed_cb = func() -> void:
-		done = true
+		connection_resolved = true
 		result = {"error": "MWA authorization failed"}
 
 	wallet_adapter.connection_established.connect(established_cb, CONNECT_ONE_SHOT)
 	wallet_adapter.connection_failed.connect(failed_cb, CONNECT_ONE_SHOT)
 
 	start_call.call()
-	
+
 	var elapsed = 0.0
-	while !done and elapsed < connect_timeout_sec:
+	while !connection_resolved and elapsed < connect_timeout_sec:
 		await get_tree().create_timer(0.1).timeout
 		elapsed += 0.1
 		var status = _safe_android_call("getConnectionStatus")
 		var action = _safe_android_call("getLatestAction")
-		print("MWA: Polling session... Status: ", status, " | Action: ", action, " | Elapsed: ", elapsed, "s")
-		
+		print_verbose("MWA: Polling session... Status: ", status, " | Action: ", action, " | Elapsed: ", elapsed, "s")
+
 		if status == 1:
-			print("MWA: Status is SUCCESS (1). Pulling results directly from JNI.")
-			var token = _safe_android_call("getAuthToken")
-			var key = _safe_android_call("getConnectedKey")
-			var wallet_uri_base = _safe_android_call("getWalletUriBase")
-			
-			var address = ""
-			if key != null:
-				if key is PackedByteArray:
-					address = SolanaUtils.bs58_encode(key)
-				else:
-					address = str(key)
-				
+			print_verbose("MWA: Status is SUCCESS (1). Pulling results directly from JNI.")
+			var parsed_account := _account_from_variant(_safe_android_call("getConnectedKey"))
+			if parsed_account.has("error"):
+				_disconnect_connection_callbacks(established_cb, failed_cb)
+				result = {"error": String(parsed_account["error"])}
+				connection_resolved = true
+				break
+
 			result = {
-				"auth_token": token,
-				"account_address": address,
-				"wallet_uri_base": wallet_uri_base,
+				"auth_token": _safe_android_call("getAuthToken"),
+				"account_address": String(parsed_account["account"]),
+				"wallet_uri_base": _safe_android_call("getWalletUriBase"),
 			}
-			# Disconnect one-shot listeners before manually triggering so they don't double-fire.
-			if wallet_adapter.connection_established.is_connected(established_cb):
-				wallet_adapter.connection_established.disconnect(established_cb)
-			if wallet_adapter.connection_failed.is_connected(failed_cb):
-				wallet_adapter.connection_failed.disconnect(failed_cb)
-			done = true
+			_disconnect_connection_callbacks(established_cb, failed_cb)
+			connection_resolved = true
 			break
 		elif status == 2:
-			print("MWA: Status is FAILURE (2).")
-			# Disconnect one-shot listeners before manually triggering.
-			if wallet_adapter.connection_established.is_connected(established_cb):
-				wallet_adapter.connection_established.disconnect(established_cb)
-			if wallet_adapter.connection_failed.is_connected(failed_cb):
-				wallet_adapter.connection_failed.disconnect(failed_cb)
+			print_verbose("MWA: Status is FAILURE (2).")
+			_disconnect_connection_callbacks(established_cb, failed_cb)
 			result = {"error": "MWA authorization failed"}
-			done = true
+			connection_resolved = true
 			break
 		elif status == 3:
-			print("MWA: Status is CANCELLED (3). User dismissed the wallet.")
-			if wallet_adapter.connection_established.is_connected(established_cb):
-				wallet_adapter.connection_established.disconnect(established_cb)
-			if wallet_adapter.connection_failed.is_connected(failed_cb):
-				wallet_adapter.connection_failed.disconnect(failed_cb)
+			print_verbose("MWA: Status is CANCELLED (3). User dismissed the wallet.")
+			_disconnect_connection_callbacks(established_cb, failed_cb)
 			_safe_android_call("clearState")
 			result = {"error": "user_cancelled"}
-			done = true
+			connection_resolved = true
 			break
-			
-	if !done:
-		# Timeout — clean up any remaining listeners.
-		if wallet_adapter.connection_established.is_connected(established_cb):
-			wallet_adapter.connection_established.disconnect(established_cb)
-		if wallet_adapter.connection_failed.is_connected(failed_cb):
-			wallet_adapter.connection_failed.disconnect(failed_cb)
+
+	if !connection_resolved:
+		_disconnect_connection_callbacks(established_cb, failed_cb)
 		_safe_android_call("clearState")
 		return {"error": "authorize timeout"}
 
@@ -169,41 +172,42 @@ func _wait_for_deauthorization(start_call: Callable) -> bool:
 	if wallet_adapter == null:
 		return false
 
-	var done := false
-	var ok := false
+	var deauth_resolved := false
+	var deauth_failed := true
 
 	# We no longer connect to C++ signals for deauth as they are inconsistent/missing.
 	start_call.call()
-	
+
 	var elapsed = 0.0
-	while !done and elapsed < connect_timeout_sec:
+	while !deauth_resolved and elapsed < connect_timeout_sec:
 		await get_tree().create_timer(0.1).timeout
 		elapsed += 0.1
 		var status = _safe_android_call("getConnectionStatus")
-		print("MWA: Polling deauth... Status: ", status, " | Elapsed: ", elapsed, "s")
-		
+		print_verbose("MWA: Polling deauth... Status: ", status, " | Elapsed: ", elapsed, "s")
+
 		# For deauth, Success=1 means the disconnect operation finished successfully.
 		if status == 1:
-			print("MWA: Deauth SUCCESS (1).")
-			ok = true
-			done = true
+			print_verbose("MWA: Deauth SUCCESS (1).")
+			deauth_failed = false
+			deauth_resolved = true
 			break
 		elif status == 2:
-			print("MWA: Deauth FAILURE (2).")
-			done = true
+			print_verbose("MWA: Deauth FAILURE (2).")
+			deauth_failed = true
+			deauth_resolved = true
 			break
 		elif status == 3:
-			print("MWA: Deauth CANCELLED (3). User dismissed the wallet.")
+			print_verbose("MWA: Deauth CANCELLED (3). User dismissed the wallet.")
 			_safe_android_call("clearState")
 			# Treat cancel as successful disconnect from the user's perspective.
-			ok = true
-			done = true
+			deauth_failed = false
+			deauth_resolved = true
 			break
-			
-	if !done:
+
+	if !deauth_resolved:
 		_safe_android_call("clearState")
-		
-	return ok
+
+	return !deauth_failed
 
 func _start_deauthorize(token: String) -> void:
 	wallet_adapter.deauthorize(token)
@@ -239,7 +243,7 @@ func authorize(identity_name: String, identity_uri: String, chain: Chain, auth_t
 	if res.has("error"):
 		var err_msg := String(res.get("error", "unknown"))
 		if err_msg == "user_cancelled":
-			print("MWA: Authorization cancelled by user.")
+			print_verbose("MWA: Authorization cancelled by user.")
 		authorization_failed.emit(err_msg)
 		return res
 
@@ -277,7 +281,7 @@ func deauthorize(auth_token: String) -> bool:
 	if wallet_adapter.has_method("set_auth_token"):
 		wallet_adapter.set_auth_token(token)
 
-	var ok := await _wait_for_deauthorization(func():
+	var deauth_succeeded := await _wait_for_deauthorization(func():
 		var plugin = _get_android_plugin()
 		if plugin:
 			_safe_android_call("deauthorizeWallet", token)
@@ -286,7 +290,7 @@ func deauthorize(auth_token: String) -> bool:
 			if wallet_adapter.has_method("deauthorize"):
 				wallet_adapter.deauthorize(token)
 	)
-	if ok:
+	if deauth_succeeded:
 		auth_cache.clear_token()
 		deauthorized.emit()
 		disconnected.emit()
@@ -359,10 +363,10 @@ func _wait_for_signing(start_call: Callable) -> Dictionary:
 		elapsed += 0.1
 		var conn_status = _safe_android_call("getConnectionStatus")
 		var status = _safe_android_call("getSigningStatus")
-		print("MWA: Polling signing... ConnStatus: ", conn_status, " | SignStatus: ", status, " | Elapsed: ", elapsed, "s")
+		print_verbose("MWA: Polling signing... ConnStatus: ", conn_status, " | SignStatus: ", status, " | Elapsed: ", elapsed, "s")
 		
 		if status == 1:
-			print("MWA: Signing SUCCESS (1). Pulling signature via JNI.")
+			print_verbose("MWA: Signing SUCCESS (1). Pulling signature via JNI.")
 			var sig = _safe_android_call("getMessageSignature")
 			signature = sig
 			# Disconnect one-shot listeners before manually resolving.
@@ -374,7 +378,7 @@ func _wait_for_signing(start_call: Callable) -> Dictionary:
 			done = true
 			break
 		elif status == 2:
-			print("MWA: Signing FAILURE (2).")
+			print_verbose("MWA: Signing FAILURE (2).")
 			if wallet_adapter.message_signed.is_connected(signed_cb):
 				wallet_adapter.message_signed.disconnect(signed_cb)
 			if wallet_adapter.signing_failed.is_connected(failed_cb):
@@ -383,7 +387,7 @@ func _wait_for_signing(start_call: Callable) -> Dictionary:
 			done = true
 			break
 		elif conn_status == 3 or status == 3:
-			print("MWA: Signing CANCELLED (3). User dismissed the wallet. (conn_status=", conn_status, ", status=", status, ")")
+			print_verbose("MWA: Signing CANCELLED (3). User dismissed the wallet. (conn_status=", conn_status, ", status=", status, ")")
 			if wallet_adapter.message_signed.is_connected(signed_cb):
 				wallet_adapter.message_signed.disconnect(signed_cb)
 			if wallet_adapter.signing_failed.is_connected(failed_cb):
@@ -481,9 +485,9 @@ func signAndSendTransactions(serialized_transactions: Array) -> Dictionary:
 	if wallet_adapter == null:
 		return {"error": "wallet_adapter is null"}
 
-	print("MWA: signAndSendTransactions called with ", serialized_transactions.size(), " transactions")
+	print_verbose("MWA: signAndSendTransactions called with ", serialized_transactions.size(), " transactions")
 	for tx in serialized_transactions:
-		print("MWA: Calling JNI signTransaction (fallback) with tx size ", tx.size())
+		print_verbose("MWA: Calling JNI signTransaction (fallback) with tx size ", tx.size())
 		var res := await _wait_for_signing(func():
 			var plugin = _get_android_plugin()
 			if plugin:
@@ -502,16 +506,16 @@ func signAndSendTransactions(serialized_transactions: Array) -> Dictionary:
 		
 		var signed_tx: PackedByteArray = res["signature"]
 		var signed_tx_obj = Transaction.new_from_bytes(signed_tx)
-		print("MWA: Broadcasting transaction natively via Godot TransactionManager...")
+		print_verbose("MWA: Broadcasting transaction natively via Godot TransactionManager...")
 		var tx_data: TransactionData = await SolanaService.transaction_manager.send_transaction(signed_tx_obj)
 		
 		if tx_data.is_successful():
 			var sig_string = tx_data.data["result"]
 			sigs.append(sig_string)
-			print("MWA: Broadcasted signature: ", sig_string)
+			print_verbose("MWA: Broadcasted signature: ", sig_string)
 		else:
 			sigs.append("unknown_or_failed")
-			print("MWA: Failed to broadcast: ", tx_data.get_error_message())
+			print_verbose("MWA: Failed to broadcast: ", tx_data.get_error_message())
 
 	return {"transaction_signatures": sigs}
 
@@ -564,10 +568,10 @@ func _wait_for_capabilities(start_call: Callable) -> Dictionary:
 		await get_tree().create_timer(1.0).timeout
 		elapsed += 1.0
 		var status = _safe_android_call("getConnectionStatus")
-		print("MWA: Polling capabilities... Status: ", status, " | Elapsed: ", elapsed, "s")
+		print_verbose("MWA: Polling capabilities... Status: ", status, " | Elapsed: ", elapsed, "s")
 		
 		if status == 1:
-			print("MWA: Capabilities SUCCESS (1). Pulling JSON via JNI.")
+			print_verbose("MWA: Capabilities SUCCESS (1). Pulling JSON via JNI.")
 			var json = _safe_android_call("getCapabilitiesResultJson")
 			json_text = json
 			# Disconnect one-shot listeners before manually resolving.
@@ -578,7 +582,7 @@ func _wait_for_capabilities(start_call: Callable) -> Dictionary:
 			done = true
 			break
 		elif status == 2:
-			print("MWA: Capabilities FAILURE (2).")
+			print_verbose("MWA: Capabilities FAILURE (2).")
 			if wallet_adapter.capabilities_received.is_connected(received_cb):
 				wallet_adapter.capabilities_received.disconnect(received_cb)
 			if wallet_adapter.capabilities_failed.is_connected(failed_cb):
@@ -587,7 +591,7 @@ func _wait_for_capabilities(start_call: Callable) -> Dictionary:
 			done = true
 			break
 		elif status == 3:
-			print("MWA: Capabilities CANCELLED (3). User dismissed the wallet.")
+			print_verbose("MWA: Capabilities CANCELLED (3). User dismissed the wallet.")
 			if wallet_adapter.capabilities_received.is_connected(received_cb):
 				wallet_adapter.capabilities_received.disconnect(received_cb)
 			if wallet_adapter.capabilities_failed.is_connected(failed_cb):
